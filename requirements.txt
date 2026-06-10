@@ -1,0 +1,26 @@
+# RAG Analyst — зависимости для Streamlit Cloud (prod) и локальной разработки.
+#
+# Версии пинов выбраны под Streamlit 1.57.0 (наша основная) и Python 3.11/3.12.
+# Если что-то поломается на cloud — фиксируем точные версии по полю VERSION
+# из pip freeze.
+
+# === Core ===
+streamlit>=1.57.0
+psycopg2-binary>=2.9.9   # binary, потому что cloud не компилирует C-расширения
+pandas>=2.0
+requests>=2.31
+python-dotenv>=1.0
+
+# === LLM-провайдеры ===
+# По умолчанию prod использует Groq (бесплатный тариф) — для Anthropic / OpenAI
+# раскомментируй нужное и поставь LLM_PROVIDER в secrets.
+# Все три провайдера ходят по HTTPS, поэтому requests хватает; SDK не обязательны.
+# Раскомментируй если хочешь typed-клиента:
+#groq>=0.4.0
+#anthropic>=0.39.0
+#openai>=1.50.0
+
+# === Локальная разработка / опциональные тяжёлые модули ===
+# Для локальной разработки (Ollama, ingestion PDF, embeddings) ставь отдельно:
+#   pip install sentence-transformers torch openpyxl pymupdf docling
+# На Streamlit Cloud эти пакеты не нужны и съедят весь бюджет диска.
