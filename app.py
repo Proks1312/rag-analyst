@@ -1142,53 +1142,6 @@ with st.expander("🛠️ Конструктор вопроса", expanded=False
             args=(_selected_tpl, _qb_company, _qb_year, _qb_segment_value),
         )
 
-with st.expander("💡 Примеры вопросов — клик подставляет в поле ввода", expanded=False):
-    _ex_col_1, _ex_col_2 = st.columns(2)
-
-    _sql_examples = [
-        ("Динамика выручки",
-         "Покажи динамику выручки АО ЭКЗ за 2022-2025"),
-        ("Топ-5 по выручке",
-         "Топ-5 компаний по выручке за 2024 год"),
-        ("Operating Margin",
-         "Посчитай Operating Margin АО СИБКАБЕЛЬ за 2022-2025"),
-        ("Quick Ratio < 1",
-         "У каких компаний Quick Ratio меньше 1 на конец 2024?"),
-        ("Сравни две компании",
-         "Сравни АО СИБКАБЕЛЬ и ПАО НЛМК по Asset Turnover за 2024"),
-        ("Убыточные компании",
-         "Какие компании показали убыток в 2025 году?"),
-        ("Финансовое здоровье",
-         "Как ты оценишь финансовое состояние АО ЭКЗ?"),
-        ("Все 5 коэффициентов",
-         "Посчитай Operating Margin, Asset Turnover, Debtors Share, "
-         "Quick Ratio и SGA Ratio для АО ЭКЗ за 2024"),
-        ("Структура баланса",
-         "Покажи структуру баланса ПАО НЛМК на конец 2024 — "
-         "внеоборотные, оборотные, капитал, обязательства"),
-        ("Лидеры по марже",
-         "Топ-3 компаний по Operating Margin в 2024"),
-    ]
-    _half = (len(_sql_examples) + 1) // 2
-    with _ex_col_1:
-        for _i, (_label, _q) in enumerate(_sql_examples[:_half]):
-            st.button(
-                _label,
-                key=f"_ex_sql_a_{_i}",
-                on_click=_cb_set_question,
-                args=(_q,),
-                use_container_width=True,
-            )
-    with _ex_col_2:
-        for _i, (_label, _q) in enumerate(_sql_examples[_half:]):
-            st.button(
-                _label,
-                key=f"_ex_sql_b_{_i}",
-                on_click=_cb_set_question,
-                args=(_q,),
-                use_container_width=True,
-            )
-
 with st.expander("📊 Финансовые показатели — что считаем и почему", expanded=False):
     _glossary = _get_indicator_glossary()
     if not _glossary:
