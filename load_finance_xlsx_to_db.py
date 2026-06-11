@@ -229,11 +229,34 @@ def _cell_num(value):
 # DB HELPERS
 # ============================================================
 
-def get_conn():
+def get_conn(target: str = "local"):
     # Ленивый импорт — чтобы dry-run работал даже без psycopg2 в venv.
     import psycopg2
 
     load_dotenv(PROJECT_ROOT / ".env")
+
+    if target == "supabase":
+        # Прод: одна строка SUPABASE_DB_URL в .env (Session Pooler URI).
+        url = os.getenv("SUPABASE_DB_URL")
+        if not url:
+            raise SystemExit(
+                "target=supabase, но SUPABASE_DB_URL не задан в .env. "
+                "Добавь строку SUPABASE_DB_URL=postgresql://...@...pooler.supabase.com:5432/postgres"
+            )
+        # Через Session Pooler (pgBouncer) держать долгую транзакцию нельзя —
+        # он рвёт соединение и оставляет «зомби» idle in transaction с локами.
+        # Поэтому: autocommit (каждый UPSERT фиксируется сразу) + TCP keepalive.
+        conn = psycopg2.connect(
+            url,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5,
+        )
+        conn.autocommit = True
+        return conn
+
+    # Локаль (по умолчанию): из PG_* в .env.
     return psycopg2.connect(
         host=os.getenv("PG_HOST"),
         port=os.getenv("PG_PORT"),
@@ -294,72 +317,82 @@ def upsert_income_row(conn, company_id: int, year: int,
 
 
 # ============================================================
-# SEGMENTS (company.segment <- finance.segment_map)
+# SEGMENTS (company.segment <- segments.xlsx)
 # ============================================================
 
-# Применяет справочник finance.segment_map к company.segment.
-# На каждую компанию берётся самый длинный (самый специфичный) подошедший
-# ILIKE-паттерн — это исключает неоднозначность при пересечении шаблонов.
-# Тот же запрос лежит в finance_segment_map.sql (секция 4).
-APPLY_SEGMENTS_SQL = """
-UPDATE finance.company c
-SET segment = sub.segment
-FROM (
-    SELECT DISTINCT ON (comp_id) comp_id, segment
-    FROM (
-        SELECT c.id AS comp_id, m.segment, length(m.pattern) AS plen
-        FROM finance.company c
-        JOIN finance.segment_map m ON c.short_name ILIKE m.pattern
-    ) j
-    ORDER BY comp_id, plen DESC
-) sub
-WHERE c.id = sub.comp_id;
-"""
+# Справочник сегментов — обычный Excel рядом со скриптом: колонки
+# "company" (имя как в short_name) и "segment". Редактируется в Excel,
+# на сервер не возится (значения уезжают в БД при заливке, дальше — дампом).
+SEGMENTS_XLSX = PROJECT_ROOT / "segments.xlsx"
 
 
-def ensure_segment_schema(conn) -> None:
+def _norm_name(s: str) -> str:
     """
-    Идемпотентно гарантирует, что колонка company.segment и таблица
-    finance.segment_map существуют. Сами строки маппинга НЕ сидим здесь —
-    источник истины это finance_segment_map.sql / правки в Adminer.
+    Нормализация имени для матча: регистр, ё→е, убираем подчёркивания и
+    все пробелы. Так «ОАО БХЗ», «ОАО_БХЗ», «оао  бхз» совпадут.
     """
+    s = (s or "").lower().replace("ё", "е")
+    return re.sub(r"[\s_]+", "", s)
+
+
+def load_segments_xlsx(path: Path) -> dict[str, str]:
+    """
+    Читает segments.xlsx -> {нормализованное_имя: segment}.
+    Первая строка — заголовок (company, segment), пропускаем.
+    Если файла нет — возвращает пустой словарь.
+    """
+    if not path.exists():
+        print(f"[segments] {path.name} не найден — сегменты не проставляю.")
+        return {}
+
+    import openpyxl
+
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        rows = list(wb.worksheets[0].iter_rows(values_only=True))
+    finally:
+        wb.close()
+
+    mapping: dict[str, str] = {}
+    for row in rows[1:]:  # пропускаем заголовок
+        if not row or row[0] is None:
+            continue
+        company = str(row[0]).strip()
+        segment = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+        if company and segment:
+            mapping[_norm_name(company)] = segment
+    return mapping
+
+
+def ensure_segment_column(conn) -> None:
+    """Идемпотентно гарантирует колонку company.segment и индекс по ней."""
     with conn.cursor() as cur:
         cur.execute("ALTER TABLE finance.company ADD COLUMN IF NOT EXISTS segment TEXT;")
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_company_segment ON finance.company(segment);"
         )
-        # Без PRIMARY KEY на pattern: дефолтная коллация БД склеивает близкие
-        # строки (ё=е, _=пробел) и роняет ON CONFLICT. Уникальность — отдельным
-        # байт-точным индексом (COLLATE "C"), колонка остаётся в дефолтной
-        # коллации, чтобы ILIKE корректно сворачивал регистр кириллицы.
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS finance.segment_map (
-                pattern  TEXT NOT NULL,
-                segment  TEXT NOT NULL
-            );
-            """
-        )
-        cur.execute(
-            'CREATE UNIQUE INDEX IF NOT EXISTS uq_segment_map_pattern '
-            'ON finance.segment_map (pattern COLLATE "C");'
-        )
     conn.commit()
 
 
-def apply_segments(conn) -> list[str]:
+def apply_segments(conn, seg_map: dict[str, str]) -> list[str]:
     """
-    Проставляет company.segment из finance.segment_map и возвращает список
-    short_name компаний, для которых сегмент так и не определился (NULL) —
-    их нужно добавить в segment_map.
+    Проставляет company.segment по справочнику seg_map (из segments.xlsx),
+    матчинг по нормализованному short_name. Возвращает список short_name
+    компаний, которых нет в справочнике (их нужно дописать в segments.xlsx).
     """
     with conn.cursor() as cur:
-        cur.execute(APPLY_SEGMENTS_SQL)
-        cur.execute(
-            "SELECT short_name FROM finance.company "
-            "WHERE segment IS NULL ORDER BY short_name;"
-        )
-        uncovered = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT id, short_name FROM finance.company;")
+        companies = cur.fetchall()
+        uncovered: list[str] = []
+        for cid, short_name in companies:
+            segment = seg_map.get(_norm_name(short_name))
+            if segment:
+                cur.execute(
+                    "UPDATE finance.company SET segment = %s WHERE id = %s;",
+                    (segment, cid),
+                )
+            else:
+                uncovered.append(short_name)
     conn.commit()
     return uncovered
 
@@ -438,6 +471,13 @@ def parse_args():
         action="store_true",
         help="Только распарсить и напечатать суммы, без записи в БД.",
     )
+    p.add_argument(
+        "--target",
+        choices=["local", "supabase"],
+        default="local",
+        help="Куда лить: local (PG_* из .env, по умолчанию) или "
+             "supabase (SUPABASE_DB_URL из .env).",
+    )
     return p.parse_args()
 
 
@@ -463,12 +503,13 @@ def main() -> None:
     print("=" * 78)
     print(f"Source dir: {xlsx_dir}")
     print(f"Файлов:     {len(files)}")
+    print(f"Target:     {args.target.upper()}")
     print(f"Dry run:    {args.dry_run}")
     print("=" * 78)
 
-    conn = None if args.dry_run else get_conn()
+    conn = None if args.dry_run else get_conn(args.target)
     if conn is not None:
-        ensure_segment_schema(conn)
+        ensure_segment_column(conn)
 
     try:
         total_balance_rows = 0
@@ -499,10 +540,11 @@ def main() -> None:
                 upsert_income_row(conn, company_id, year, values)
             conn.commit()
 
-        # Проставляем сегменты из справочника finance.segment_map.
+        # Проставляем сегменты из справочника segments.xlsx.
         uncovered: list[str] = []
         if conn is not None:
-            uncovered = apply_segments(conn)
+            seg_map = load_segments_xlsx(SEGMENTS_XLSX)
+            uncovered = apply_segments(conn, seg_map)
 
         print("=" * 78)
         print("DONE")
@@ -513,21 +555,27 @@ def main() -> None:
             print("(dry-run: в БД ничего не записано)")
         elif uncovered:
             print("=" * 78)
-            print(f"⚠️  Без сегмента ({len(uncovered)}) — добавь паттерн в")
-            print("    finance.segment_map (Adminer) или в finance_segment_map.sql:")
+            print(f"⚠️  Без сегмента ({len(uncovered)}) — добавь строку в")
+            print(f"    {SEGMENTS_XLSX.name} (колонки company, segment):")
             for name in uncovered:
                 print(f"      • {name}")
         else:
-            print("Сегменты: все компании покрыты finance.segment_map.")
+            print("Сегменты: все компании покрыты segments.xlsx.")
         print("=" * 78)
 
     except Exception:
         if conn is not None:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception:
+                pass  # соединение уже закрыто — глотаем вторичную ошибку
         raise
     finally:
         if conn is not None:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
